@@ -39,7 +39,7 @@ def evaluate_dgm_errors(net, lqr, eval_points=None, N_steps=500, N_samples=5000)
             torch.tensor([[t0]], dtype=torch.float32),
             torch.tensor(np.asarray(x0, dtype=float).reshape(1, -1), dtype=torch.float32),
         ).item()
-        u_mc = lqr.monte_carlo_constant_control(lqr, t=t0, x=np.asarray(x0), N_steps=N_steps, N_samples=N_samples, alpha=alpha)
+        u_mc = lqr.monte_carlo_constant_control(t=t0, x=np.asarray(x0), N_steps=N_steps, N_samples=N_samples, alpha=alpha)
         errs.append(abs(u_pred - u_mc))
     return float(np.mean(errs))
 
