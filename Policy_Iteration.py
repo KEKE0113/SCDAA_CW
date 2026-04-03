@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 from DGM import build_value_network
 from FNN import build_control_network
 
+
 def quadratic_form_batch(x, A):
     return (x @ A * x).sum(dim=1, keepdim=True)
 
@@ -14,9 +15,9 @@ def diffusion_trace_term(u_x, x, sig_sig_T):
     hess_cols = []
     for i in range(dim_x):
         grad_i = torch.autograd.grad(
-            u_x[:, i:i+1],
+            u_x[:, i:i + 1],
             x,
-            grad_outputs=torch.ones_like(u_x[:, i:i+1]),
+            grad_outputs=torch.ones_like(u_x[:, i:i + 1]),
             create_graph=True,
             retain_graph=True,
         )[0]
@@ -25,20 +26,37 @@ def diffusion_trace_term(u_x, x, sig_sig_T):
     return torch.einsum("ij,nji->n", sig_sig_T, hess).view(batch_size, 1)
 
 
-@torch.no_grad()
-def evaluate_policy_iteration(net_val, net_act, lqr, n_test=128, x_range=2.0):
-    t_test = torch.rand(n_test, 1) * lqr.T
-    x_test = torch.empty(n_test, 2).uniform_(-x_range, x_range)
+def build_policy_test_set(lqr, n_test=128, x_range=2.0, seed=2026):
+    """
+    Fixed benchmark test set used after each policy iteration so that the comparison
+    with Exercise 1.1 is made on the same points every time.
+    """
+    gen = torch.Generator()
+    gen.manual_seed(seed)
+    t_test = torch.rand(n_test, 1, generator=gen) * lqr.T
+    x_test = (2.0 * x_range) * torch.rand(n_test, 2, generator=gen) - x_range
+    return t_test, x_test
 
-    v_exact = lqr.Sol_value(t_test.squeeze(1), x_test).squeeze(1).numpy()
-    v_pred = net_val(t_test, x_test).squeeze(1).numpy()
+
+@torch.no_grad()
+def evaluate_policy_iteration(net_val, net_act, lqr, t_test=None, x_test=None, n_test=128, x_range=2.0, seed=2026):
+    if t_test is None or x_test is None:
+        t_test, x_test = build_policy_test_set(lqr, n_test=n_test, x_range=x_range, seed=seed)
+
+    v_exact = lqr.Sol_value(t_test.squeeze(1), x_test).squeeze(1).cpu().numpy()
+    v_pred = net_val(t_test, x_test).squeeze(1).cpu().numpy()
     err_val = float(np.mean(np.abs(v_pred - v_exact)))
 
-    a_exact = lqr.control(t_test.squeeze(1), x_test).numpy()
-    a_pred = net_act(torch.cat([t_test, x_test], dim=1)).numpy()
+    a_exact = lqr.control(t_test.squeeze(1), x_test).cpu().numpy()
+    a_pred = net_act(torch.cat([t_test, x_test], dim=1)).cpu().numpy()
     err_act = float(np.mean(np.linalg.norm(a_pred - a_exact, axis=1)))
 
     return err_val, err_act
+
+
+def set_requires_grad(model, flag):
+    for param in model.parameters():
+        param.requires_grad_(flag)
 
 
 def train_policy_iteration(
@@ -70,6 +88,7 @@ def train_policy_iteration(
     if initial_control_net is not None:
         print("Using Exercise 2.2 control network as the initial guess for policy iteration.")
 
+    fixed_t_test, fixed_x_test = build_policy_test_set(lqr, n_test=128, x_range=2.0, seed=2026)
     iter_errors_val, iter_errors_act = [], []
 
     for iteration in range(n_iterations):
@@ -78,6 +97,12 @@ def train_policy_iteration(
         print("=" * 60)
 
         optimizer_val = torch.optim.Adam(net_val.parameters(), lr=lr)
+        scheduler_val = torch.optim.lr_scheduler.StepLR(
+            optimizer_val,
+            step_size=max(1, n_epochs_val // 2),
+            gamma=0.5,
+        )
+
         for epoch in range(n_epochs_val):
             optimizer_val.zero_grad()
 
@@ -86,12 +111,24 @@ def train_policy_iteration(
             x = torch.empty(batch_size, 2).uniform_(-x_range, x_range)
             x.requires_grad_(True)
 
-            tx = torch.cat([t.detach(), x.detach()], dim=1)
-            a = net_act(tx)
-            u = net_val(t, x)
+            with torch.no_grad():
+                a = net_act(torch.cat([t.detach(), x.detach()], dim=1))
 
-            u_t = torch.autograd.grad(u, t, grad_outputs=torch.ones_like(u), create_graph=True, retain_graph=True)[0]
-            u_x = torch.autograd.grad(u, x, grad_outputs=torch.ones_like(u), create_graph=True, retain_graph=True)[0]
+            u = net_val(t, x)
+            u_t = torch.autograd.grad(
+                u,
+                t,
+                grad_outputs=torch.ones_like(u),
+                create_graph=True,
+                retain_graph=True,
+            )[0]
+            u_x = torch.autograd.grad(
+                u,
+                x,
+                grad_outputs=torch.ones_like(u),
+                create_graph=True,
+                retain_graph=True,
+            )[0]
 
             trace_term = diffusion_trace_term(u_x, x, sig_sig_T)
             term_Hx = (u_x * (x @ H.T)).sum(dim=1, keepdim=True)
@@ -110,12 +147,26 @@ def train_policy_iteration(
 
             loss = loss_pde + loss_bdy
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(net_val.parameters(), max_norm=1.0)
             optimizer_val.step()
+            scheduler_val.step()
 
             if epoch % max(1, n_epochs_val // 5) == 0:
-                print(f"  [Value] epoch {epoch}/{n_epochs_val}, loss={loss.item():.6f}")
+                current_lr = scheduler_val.get_last_lr()[0]
+                print(
+                    f"  [Value] epoch {epoch}/{n_epochs_val}, "
+                    f"total={loss.item():.6f}, pde={loss_pde.item():.6f}, "
+                    f"boundary={loss_bdy.item():.6f}, lr={current_lr:.2e}"
+                )
 
+        set_requires_grad(net_val, False)
         optimizer_act = torch.optim.Adam(net_act.parameters(), lr=lr)
+        scheduler_act = torch.optim.lr_scheduler.StepLR(
+            optimizer_act,
+            step_size=max(1, n_epochs_act // 2),
+            gamma=0.5,
+        )
+
         for epoch in range(n_epochs_act):
             optimizer_act.zero_grad()
 
@@ -124,7 +175,13 @@ def train_policy_iteration(
             x.requires_grad_(True)
 
             u = net_val(t, x)
-            u_x = torch.autograd.grad(u, x, grad_outputs=torch.ones_like(u), create_graph=False, retain_graph=False)[0].detach()
+            u_x = torch.autograd.grad(
+                u,
+                x,
+                grad_outputs=torch.ones_like(u),
+                create_graph=False,
+                retain_graph=False,
+            )[0].detach()
 
             a = net_act(torch.cat([t, x.detach()], dim=1))
             Hx = x.detach() @ H.T
@@ -132,18 +189,29 @@ def train_policy_iteration(
 
             Hamiltonian = (u_x * Hx).sum(dim=1, keepdim=True) + (u_x * Ma).sum(dim=1, keepdim=True)
             Hamiltonian += quadratic_form_batch(x.detach(), C) + quadratic_form_batch(a, D)
-            loss_act = Hamiltonian.mean()  # minimise over controls
+            loss_act = Hamiltonian.mean()
             loss_act.backward()
+            torch.nn.utils.clip_grad_norm_(net_act.parameters(), max_norm=1.0)
             optimizer_act.step()
+            scheduler_act.step()
 
             if epoch % max(1, n_epochs_act // 5) == 0:
-                print(f"  [Control] epoch {epoch}/{n_epochs_act}, Hamiltonian={loss_act.item():.6f}")
+                current_lr = scheduler_act.get_last_lr()[0]
+                print(f"  [Control] epoch {epoch}/{n_epochs_act}, Hamiltonian={loss_act.item():.6f}, lr={current_lr:.2e}")
 
-        err_val, err_act = evaluate_policy_iteration(net_val, net_act, lqr)
+        set_requires_grad(net_val, True)
+
+        err_val, err_act = evaluate_policy_iteration(
+            net_val,
+            net_act,
+            lqr,
+            t_test=fixed_t_test,
+            x_test=fixed_x_test,
+        )
         iter_errors_val.append(err_val)
         iter_errors_act.append(err_act)
-        print(f"  mean |v_pred-v_exact| = {err_val:.4e}")
-        print(f"  mean ||a_pred-a_exact|| = {err_act:.4e}")
+        print(f"  mean |v_pred-v_exact| on fixed test set = {err_val:.4e}")
+        print(f"  mean ||a_pred-a_exact|| on fixed test set = {err_act:.4e}")
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
     ax1.semilogy(range(1, n_iterations + 1), iter_errors_val, "bo-")

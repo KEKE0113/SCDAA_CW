@@ -1,8 +1,8 @@
 import torch
-import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
 from DGM import *
+
 
 def quadratic_form_batch(x, A):
     return (x @ A * x).sum(dim=1, keepdim=True)
@@ -14,9 +14,9 @@ def diffusion_trace_term(u_x, x, sig_sig_T):
     hess_cols = []
     for i in range(dim_x):
         grad_i = torch.autograd.grad(
-            u_x[:, i:i+1],
+            u_x[:, i:i + 1],
             x,
-            grad_outputs=torch.ones_like(u_x[:, i:i+1]),
+            grad_outputs=torch.ones_like(u_x[:, i:i + 1]),
             create_graph=True,
             retain_graph=True,
         )[0]
@@ -24,26 +24,75 @@ def diffusion_trace_term(u_x, x, sig_sig_T):
     hess = torch.cat(hess_cols, dim=2)  # [N, dim_x, dim_x]
     return torch.einsum("ij,nji->n", sig_sig_T, hess).view(batch_size, 1)
 
-@torch.no_grad()
-def evaluate_dgm_errors(net, lqr, eval_points=None, N_steps=500, N_samples=5000):
-    if eval_points is None:
-        eval_points = [
-            (0.0, np.array([1.0, 1.0])),
-            (0.25 * lqr.T, np.array([0.0, 1.0])),
-            (0.5 * lqr.T, np.array([1.0, -1.0])),
-        ]
-    alpha = np.array([1.0, 1.0], dtype=float)
-    errs = []
-    for t0, x0 in eval_points:
-        u_pred = net(
-            torch.tensor([[t0]], dtype=torch.float32),
-            torch.tensor(np.asarray(x0, dtype=float).reshape(1, -1), dtype=torch.float32),
-        ).item()
-        u_mc = lqr.monte_carlo_constant_control(t=t0, x=np.asarray(x0), N_steps=N_steps, N_samples=N_samples, alpha=alpha)
-        errs.append(abs(u_pred - u_mc))
-    return float(np.mean(errs))
 
-def train_dgm_linear_pde(lqr, n_epochs=5000, batch_size=256, lr=1e-3, eval_every=500, x_range=3.0, net=None):
+def build_default_dgm_eval_points(T):
+    """
+    Fixed validation set used throughout Exercise 3.1 so that the error curve is
+    comparable across training epochs.
+    """
+    times = [0.0, 0.25 * T, 0.50 * T]
+    states = [
+        np.array([1.0, 1.0], dtype=float),
+        np.array([0.0, 1.0], dtype=float),
+        np.array([1.0, -1.0], dtype=float),
+    ]
+    return [(float(t0), x0.copy()) for t0 in times for x0 in states]
+
+
+def precompute_dgm_mc_benchmark(
+    lqr,
+    eval_points,
+    N_steps=500,
+    N_samples=5000,
+    alpha=None,
+    base_seed=2026,
+):
+    """
+    Reuse the Exercise 1.2 Monte Carlo routine, with the optimal control replaced
+    by the constant control alpha=(1,1)^T, and precompute the benchmark values once.
+    """
+    if alpha is None:
+        alpha = np.array([1.0, 1.0], dtype=float)
+    else:
+        alpha = np.asarray(alpha, dtype=float).reshape(-1)
+
+    mc_values = []
+    for idx, (t0, x0) in enumerate(eval_points):
+        value = lqr.monte_carlo_constant_control(
+            t=t0,
+            x=np.asarray(x0, dtype=float),
+            N_steps=N_steps,
+            N_samples=N_samples,
+            alpha=alpha,
+            seed=base_seed + idx,
+        )
+        mc_values.append(float(value))
+    return np.asarray(mc_values, dtype=float)
+
+
+@torch.no_grad()
+def evaluate_dgm_errors(net, eval_points, mc_values):
+    """
+    Compute the mean absolute error against a fixed Monte Carlo benchmark.
+    """
+    t_eval = torch.tensor([[pt[0]] for pt in eval_points], dtype=torch.float32)
+    x_eval = torch.tensor(np.stack([pt[1] for pt in eval_points]), dtype=torch.float32)
+    u_pred = net(t_eval, x_eval).squeeze(1).cpu().numpy()
+    return float(np.mean(np.abs(u_pred - mc_values)))
+
+
+def train_dgm_linear_pde(
+    lqr,
+    n_epochs=5000,
+    batch_size=256,
+    lr=1e-3,
+    eval_every=500,
+    x_range=3.0,
+    net=None,
+    eval_points=None,
+    benchmark_steps=500,
+    benchmark_samples=5000,
+):
     """Exercise 3.1: DGM for the linear PDE under constant control alpha=(1,1)."""
     alpha = torch.tensor([1.0, 1.0], dtype=torch.float32)
     T = lqr.T
@@ -61,6 +110,21 @@ def train_dgm_linear_pde(lqr, n_epochs=5000, batch_size=256, lr=1e-3, eval_every
 
     net = build_value_network(dim_x=2, hidden_size=100) if net is None else net
     optimizer = torch.optim.Adam(net.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer,
+        step_size=max(1, n_epochs // 3),
+        gamma=0.5,
+    )
+
+    if eval_points is None:
+        eval_points = build_default_dgm_eval_points(T)
+    mc_values = precompute_dgm_mc_benchmark(
+        lqr,
+        eval_points=eval_points,
+        N_steps=benchmark_steps,
+        N_samples=benchmark_samples,
+        alpha=alpha.detach().cpu().numpy(),
+    )
 
     losses, eqn_losses, bdy_losses = [], [], []
     eval_epochs, mc_errors = [], []
@@ -74,8 +138,20 @@ def train_dgm_linear_pde(lqr, n_epochs=5000, batch_size=256, lr=1e-3, eval_every
         x_int.requires_grad_(True)
 
         u = net(t_int, x_int)
-        u_t = torch.autograd.grad(u, t_int, grad_outputs=torch.ones_like(u), create_graph=True, retain_graph=True)[0]
-        u_x = torch.autograd.grad(u, x_int, grad_outputs=torch.ones_like(u), create_graph=True, retain_graph=True)[0]
+        u_t = torch.autograd.grad(
+            u,
+            t_int,
+            grad_outputs=torch.ones_like(u),
+            create_graph=True,
+            retain_graph=True,
+        )[0]
+        u_x = torch.autograd.grad(
+            u,
+            x_int,
+            grad_outputs=torch.ones_like(u),
+            create_graph=True,
+            retain_graph=True,
+        )[0]
 
         trace_term = diffusion_trace_term(u_x, x_int, sig_sig_T)
         term_Hx = (u_x * (x_int @ H.T)).sum(dim=1, keepdim=True)
@@ -93,23 +169,26 @@ def train_dgm_linear_pde(lqr, n_epochs=5000, batch_size=256, lr=1e-3, eval_every
 
         loss = loss_eqn + loss_bdy
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
         optimizer.step()
+        scheduler.step()
 
         losses.append(loss.item())
         eqn_losses.append(loss_eqn.item())
         bdy_losses.append(loss_bdy.item())
 
         if epoch % max(1, n_epochs // 10) == 0:
+            current_lr = scheduler.get_last_lr()[0]
             print(
                 f"Epoch {epoch}/{n_epochs} | total={loss.item():.6f} | "
-                f"pde={loss_eqn.item():.6f} | boundary={loss_bdy.item():.6f}"
+                f"pde={loss_eqn.item():.6f} | boundary={loss_bdy.item():.6f} | lr={current_lr:.2e}"
             )
 
         if epoch % eval_every == 0:
-            err = evaluate_dgm_errors(net, lqr)
+            err = evaluate_dgm_errors(net, eval_points, mc_values)
             eval_epochs.append(epoch)
             mc_errors.append(err)
-            print(f"  -> mean MC benchmark error = {err:.4e}")
+            print(f"  -> mean MC benchmark error on fixed validation set = {err:.4e}")
 
     plt.figure(figsize=(8, 5))
     plt.semilogy(losses, label="Total loss")
@@ -136,4 +215,6 @@ def train_dgm_linear_pde(lqr, n_epochs=5000, batch_size=256, lr=1e-3, eval_every
         "bdy_losses": bdy_losses,
         "eval_epochs": eval_epochs,
         "mc_errors": mc_errors,
+        "eval_points": eval_points,
+        "mc_values": mc_values.tolist(),
     }
