@@ -25,7 +25,7 @@ pip install numpy scipy matplotlib torch
 - `FNN.py` — Exercise 2.2 control network
 - `PDE_Solve_dgm.py` — Exercise 3.1
 - `Policy_Iteration.py` — Exercise 4.1
-- `Test_Extra.py` — Extra tests for validation
+- `Validation_Test.py` — Extra tests for validation
 - `Main.ipynb` — runs the coursework in order
 
 ## How to run
